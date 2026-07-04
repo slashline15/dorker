@@ -1,14 +1,19 @@
 """CLI entry point for dorker."""
 
 import argparse
+import asyncio
 import logging
 import sys
-import time
-from typing import Optional
 
-from dorker.engines import DuckDuckGoEngine, SearXEngine, GoogleEngine, MojeekEngine, SearchResult
-from dorker.anti_detect import Session, DelayManager
+from dorker import history
+from dorker.dedup import deduplicate
+from dorker.engines import ENGINES, SearchResult
+from dorker.filters import filter_results
+from dorker.orchestrator import run_search
 from dorker.output import write_output
+from dorker.proxy import ProxyPool
+from dorker.ranking import rank
+from dorker.repl import run_repl
 
 logger = logging.getLogger("dorker")
 
@@ -29,11 +34,18 @@ Examples:
 
     p.add_argument(
         "query",
-        help="Search query / dork string",
+        nargs="?",
+        default=None,
+        help="Search query / dork string (omit to enter interactive mode)",
+    )
+    p.add_argument(
+        "-i", "--interactive",
+        action="store_true",
+        help="Enter interactive REPL mode (also triggered by omitting query)",
     )
     p.add_argument(
         "-e", "--engine",
-        choices=["duckduckgo", "searx", "google", "mojeek", "all"],
+        choices=[*ENGINES, "all"],
         default="all",
         help="Search engine to use (default: all)",
     )
@@ -80,68 +92,83 @@ Examples:
         help="Enable debug logging",
     )
     p.add_argument(
-        "--no-rotate",
+        "--proxy",
+        metavar="URL",
+        help="Proxy URL for all requests (http://, socks5://, socks5h://)",
+    )
+    p.add_argument(
+        "--tor",
         action="store_true",
-        help="Disable identity rotation between pages",
+        help="Shortcut for --proxy socks5h://127.0.0.1:9050 (standalone Tor daemon)",
+    )
+    p.add_argument(
+        "--proxy-file",
+        metavar="FILE",
+        help="File with one proxy URL per line; rotates between healthy ones",
+    )
+    p.add_argument(
+        "--include-domain",
+        action="append",
+        metavar="DOMAIN",
+        help="Only keep results from this domain (repeatable)",
+    )
+    p.add_argument(
+        "--exclude-domain",
+        action="append",
+        metavar="DOMAIN",
+        help="Drop results from this domain (repeatable)",
+    )
+    p.add_argument(
+        "--min-snippet-length",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Drop results with a snippet shorter than N characters",
+    )
+    p.add_argument(
+        "--sort",
+        choices=["score", "position", "engine"],
+        default="score",
+        help="Result order: score (relevance), position (per-engine order), or engine (default: score)",
+    )
+    p.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Don't save this search to local history",
+    )
+    p.add_argument(
+        "--ai-expand",
+        action="store_true",
+        help="Suggest AI-generated dork variations before searching (requires 'dorker[ai]' + an Anthropic API key)",
     )
 
     return p
 
 
-def run_engine(
-    engine_name: str,
-    query: str,
-    pages: int,
-    session: Session,
-    delay: DelayManager,
-    timeout: int,
-    max_retries: int,
-) -> list[SearchResult]:
-    """Run a single engine and return results."""
-    if engine_name == "duckduckgo":
-        engine = DuckDuckGoEngine(
-            session=session,
-            delay=delay,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-    elif engine_name == "searx":
-        engine = SearXEngine(
-            session=session,
-            delay=delay,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-    elif engine_name == "google":
-        engine = GoogleEngine(
-            session=session,
-            delay=delay,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-    elif engine_name == "mojeek":
-        engine = MojeekEngine(
-            session=session,
-            delay=delay,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-    else:
-        logger.error("Unknown engine: %s", engine_name)
-        return []
+def _resolve_queries(query: str, ai_expand: bool) -> list[str]:
+    """Return the list of queries to run: just the original, or the original
+    plus any AI-suggested variations the user chooses to include."""
+    if not ai_expand:
+        return [query]
 
-    if not engine.is_available():
-        logger.error("Engine %s is not available", engine_name)
-        return []
+    from dorker.ai.query_expand import suggest_variations
 
-    logger.info("Searching %s for: %s", engine_name, query)
-    start = time.monotonic()
-    results = engine.search(query, pages=pages)
-    elapsed = time.monotonic() - start
-    logger.info(
-        "%s: %d results in %.1fs", engine_name, len(results), elapsed
-    )
-    return results
+    suggestions = suggest_variations(query)
+    if not suggestions:
+        return [query]
+
+    print("AI-suggested query variations:", file=sys.stderr)
+    for i, s in enumerate(suggestions, 1):
+        print(f"  {i}. {s}", file=sys.stderr)
+
+    try:
+        choice = input("Include which? (e.g. 1,3 / blank for none): ").strip()
+    except EOFError:
+        choice = ""
+
+    indices = [int(x) for x in choice.split(",") if x.strip().isdigit()]
+    extra = [suggestions[i - 1] for i in indices if 0 < i <= len(suggestions)]
+    return [query, *extra]
 
 
 def main():
@@ -156,41 +183,63 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # Setup anti-detection
-    session = Session()
-    delay = DelayManager(min_delay=args.delay[0], max_delay=args.delay[1])
+    if args.interactive or args.query is None:
+        run_repl(args)
+        return
 
     # Determine engines to use
     if args.engine == "all":
-        engines = ["duckduckgo", "mojeek"]
+        engines = list(ENGINES)
     else:
         engines = [args.engine]
 
-    # Run engines
+    # Resolve proxy configuration
+    if args.tor and args.proxy:
+        parser.error("--tor and --proxy are mutually exclusive")
+    proxy = "socks5h://127.0.0.1:9050" if args.tor else args.proxy
+    proxy_pool = ProxyPool.from_file(args.proxy_file) if args.proxy_file else None
+
+    queries = _resolve_queries(args.query, args.ai_expand)
+
+    # Run engines concurrently (per query), each with its own isolated identity
     all_results: list[SearchResult] = []
-
-    for engine_name in engines:
-        results = run_engine(
-            engine_name=engine_name,
-            query=args.query,
-            pages=args.pages,
-            session=session,
-            delay=delay,
-            timeout=args.timeout,
-            max_retries=args.max_retries,
+    for q in queries:
+        all_results.extend(
+            asyncio.run(
+                run_search(
+                    query=q,
+                    engine_names=engines,
+                    pages=args.pages,
+                    timeout=args.timeout,
+                    max_retries=args.max_retries,
+                    delay_range=(args.delay[0], args.delay[1]),
+                    proxy=proxy,
+                    proxy_pool=proxy_pool,
+                )
+            )
         )
-        all_results.extend(results)
 
-        # Rotate identity between engines
-        if not args.no_rotate and engine_name != engines[-1]:
-            session.rotate()
+    all_results = deduplicate(all_results)
+    all_results = filter_results(
+        all_results,
+        include_domains=args.include_domain,
+        exclude_domains=args.exclude_domain,
+        min_snippet_length=args.min_snippet_length,
+    )
 
-    # Sort by position (interleaved from multiple engines)
-    all_results.sort(key=lambda r: r.position)
+    if args.sort == "score":
+        all_results = rank(all_results, args.query)
+    elif args.sort == "engine":
+        all_results.sort(key=lambda r: r.engine)
+    else:
+        all_results.sort(key=lambda r: r.position)
 
-    # Re-number positions
+    # Re-number positions to reflect the final display order
     for i, r in enumerate(all_results, 1):
         r.position = i
+
+    if not args.no_history:
+        history.save_search(args.query, engines, all_results)
 
     # Output
     write_output(all_results, fmt=args.format, output_file=args.output)

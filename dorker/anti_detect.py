@@ -138,15 +138,19 @@ class Session:
     referrer: str = field(default_factory=lambda: random.choice(REFERRER_POOL))
     accept: str = field(default_factory=lambda: random.choice(ACCEPT_POOL))
     sec_ch_ua: str = field(default_factory=lambda: random.choice(SEC_CH_UA_POOL))
+    proxy: str | None = None
+    proxy_pool: "HealthTrackedPool | None" = None
 
     def rotate(self):
-        """Rotate all identifiers for a fresh fingerprint."""
+        """Rotate all identifiers for a fresh fingerprint (and proxy, if pooled)."""
         self.user_agent = random.choice(UA_POOL)
         self.accept_lang = random.choice(LANG_POOL)
         self.referrer = random.choice(REFERRER_POOL)
         self.accept = random.choice(ACCEPT_POOL)
         self.sec_ch_ua = random.choice(SEC_CH_UA_POOL)
         self.cookie_jar = http.cookiejar.LWPCookieJar()
+        if self.proxy_pool is not None:
+            self.proxy = self.proxy_pool.pick()
 
     def headers(self, extra: dict | None = None) -> dict:
         """Build request headers from current session identity."""
@@ -154,7 +158,10 @@ class Session:
             "User-Agent": self.user_agent,
             "Accept": self.accept,
             "Accept-Language": self.accept_lang,
-            "Accept-Encoding": "gzip, deflate, br",
+            # No "br": httpx's brotli decoder chokes on some real-world
+            # responses (observed against Brave Search), turning a working
+            # request into a hard decode failure on every retry.
+            "Accept-Encoding": "gzip, deflate",
             "DNT": "1",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",

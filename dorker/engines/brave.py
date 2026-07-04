@@ -1,4 +1,4 @@
-"""Google engine — direct HTML scraping with anti-detection."""
+"""Brave Search engine — direct HTML scraping."""
 
 import logging
 from typing import Optional
@@ -11,13 +11,13 @@ from dorker.anti_detect import Session, DelayManager
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_URL = "https://www.google.com/search"
+BRAVE_URL = "https://search.brave.com/search"
 
 
-class GoogleEngine(BaseEngine):
-    """Google search via direct HTML scraping."""
+class BraveEngine(BaseEngine):
+    """Brave Search via direct HTML scraping."""
 
-    name = "google"
+    name = "brave"
 
     def __init__(
         self,
@@ -27,7 +27,7 @@ class GoogleEngine(BaseEngine):
         max_retries: int = 3,
     ):
         self.session = session or Session()
-        self.delay = delay or DelayManager(min_delay=4.0, max_delay=12.0)
+        self.delay = delay or DelayManager(min_delay=3.0, max_delay=8.0)
         self.timeout = timeout
         self.max_retries = max_retries
 
@@ -41,11 +41,9 @@ class GoogleEngine(BaseEngine):
         for page_num in range(pages):
             self.delay.wait()
 
-            start = page_num * 10
-            page_results = self._fetch_page(query, start)
+            page_results = self._fetch_page(query, offset=page_num)
 
             if not page_results:
-                logger.debug("No results on page %d, stopping", page_num + 1)
                 break
 
             for r in page_results:
@@ -58,52 +56,30 @@ class GoogleEngine(BaseEngine):
 
         return results
 
-    def _fetch_page(self, query: str, start: int) -> list[SearchResult]:
-        """Fetch a single page of Google results."""
-        params = {
-            "q": query,
-            "num": 10,
-            "start": start,
-            "hl": "en",
-            "safe": "off",
-        }
+    def _fetch_page(self, query: str, offset: int) -> list[SearchResult]:
+        params = {"q": query}
+        if offset > 0:
+            params["offset"] = offset
 
         html = fetch_with_retry(
-            GOOGLE_URL,
+            BRAVE_URL,
             params=params,
             session=self.session,
             delay=self.delay,
             timeout=self.timeout,
             max_retries=self.max_retries,
-            engine_name="Google",
+            engine_name="Brave",
         )
         if html is None:
             return []
         return self._parse_html(html)
 
     def _parse_html(self, html: str) -> list[SearchResult]:
-        """Parse Google search results page."""
         soup = BeautifulSoup(html, "lxml")
         results = []
 
-        # Google's result containers have various selectors
-        # Modern Google uses div.g or div[data-sokoban-container]
-        result_divs = soup.select("div.g")
-
-        for div in result_divs:
-            # Skip non-result divs
-            if div.select_one("div.g:not([data-sokoban-container])"):
-                continue
-
-            # Title and link
-            link_el = div.select_one("a[href^='http']")
-            if not link_el:
-                link_el = div.select_one("h3")
-                if link_el:
-                    parent_a = link_el.find_parent("a")
-                    if parent_a:
-                        link_el = parent_a
-
+        for snippet in soup.select("#results .snippet"):
+            link_el = snippet.select_one("a")
             if not link_el:
                 continue
 
@@ -111,24 +87,18 @@ class GoogleEngine(BaseEngine):
             if not url or not url.startswith("http"):
                 continue
 
-            # Title
-            title_el = div.select_one("h3")
+            title_el = link_el.select_one(".title")
             title = title_el.get_text(strip=True) if title_el else ""
 
-            # Snippet
-            snippet_els = div.select("div.VwiC3b, span.aCOpRe, div[data-sncf]")
-            snippet = ""
-            for el in snippet_els:
-                text = el.get_text(strip=True)
-                if len(text) > len(snippet):
-                    snippet = text
+            content_el = snippet.select_one(".generic-snippet .content")
+            snippet_text = content_el.get_text(strip=True) if content_el else ""
 
-            if url:
+            if url and title:
                 results.append(
                     SearchResult(
                         url=url,
                         title=title,
-                        snippet=snippet,
+                        snippet=snippet_text,
                         engine=self.name,
                         position=0,
                     )

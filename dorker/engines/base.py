@@ -15,6 +15,8 @@ class SearchResult:
     engine: str
     position: int
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    sources: list[str] = field(default_factory=list)
+    score: float = 0.0
 
 
 class BaseEngine(ABC):

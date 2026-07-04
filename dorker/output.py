@@ -19,6 +19,10 @@ def format_table(results: list[SearchResult]) -> str:
         lines.append(f"[{r.position:3d}] {r.title}")
         lines.append(f"      URL:    {r.url}")
         lines.append(f"      Engine: {r.engine}")
+        if len(r.sources) > 1:
+            lines.append(f"      Also found by: {', '.join(s for s in r.sources if s != r.engine)}")
+        if r.score:
+            lines.append(f"      Score:  {r.score:.1f}")
         if r.snippet:
             # Truncate long snippets
             snippet = r.snippet[:200] + "..." if len(r.snippet) > 200 else r.snippet
@@ -38,6 +42,8 @@ def format_json(results: list[SearchResult], pretty: bool = True) -> str:
             "snippet": r.snippet,
             "engine": r.engine,
             "timestamp": r.timestamp,
+            "sources": r.sources,
+            "score": r.score,
         }
         for r in results
     ]
@@ -49,10 +55,10 @@ def format_csv(results: list[SearchResult]) -> str:
     """Format results as CSV."""
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["position", "title", "url", "snippet", "engine", "timestamp"])
+    writer.writerow(["position", "title", "url", "snippet", "engine", "timestamp", "sources", "score"])
     for r in results:
         writer.writerow(
-            [r.position, r.title, r.url, r.snippet, r.engine, r.timestamp]
+            [r.position, r.title, r.url, r.snippet, r.engine, r.timestamp, ";".join(r.sources), r.score]
         )
     return output.getvalue()
 

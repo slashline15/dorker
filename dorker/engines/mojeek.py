@@ -2,12 +2,11 @@
 
 import logging
 from typing import Optional
-from urllib.parse import quote_plus
 
-import requests
 from bs4 import BeautifulSoup
 
 from dorker.engines.base import BaseEngine, SearchResult
+from dorker.engines.scraping_base import fetch_with_retry
 from dorker.anti_detect import Session, DelayManager
 
 logger = logging.getLogger(__name__)
@@ -76,41 +75,20 @@ class MojeekEngine(BaseEngine):
         return results
 
     def _fetch_page(self, params: dict) -> list[SearchResult]:
-        for attempt in range(self.max_retries):
-            try:
-                r = requests.get(
-                    MOJEEK_URL,
-                    params=params,
-                    headers=self.session.headers({"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}),
-                    timeout=self.timeout,
-                )
-
-                if r.status_code == 429 or r.status_code == 403:
-                    logger.warning("Mojeek rate limited — backing off")
-                    self.delay.mark_error()
-                    self.delay.wait()
-                    self.session.rotate()
-                    continue
-
-                if r.status_code != 200:
-                    logger.warning("Mojeek returned %d", r.status_code)
-                    self.delay.mark_error()
-                    self.delay.wait()
-                    continue
-
-                self.delay.mark_success()
-                return self._parse_html(r.text)
-
-            except requests.Timeout:
-                logger.warning("Mojeek timeout on attempt %d", attempt + 1)
-                self.delay.mark_error()
-                self.delay.wait()
-            except requests.RequestException as e:
-                logger.warning("Mojeek error: %s", e)
-                self.delay.mark_error()
-                self.delay.wait()
-
-        return []
+        html = fetch_with_retry(
+            MOJEEK_URL,
+            params=params,
+            session=self.session,
+            delay=self.delay,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            engine_name="Mojeek",
+            extra_headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+            rate_limit_statuses=(429, 403),
+        )
+        if html is None:
+            return []
+        return self._parse_html(html)
 
     def _parse_html(self, html: str) -> list[SearchResult]:
         soup = BeautifulSoup(html, "lxml")

@@ -40,7 +40,7 @@ class DuckDuckGoEngine(BaseEngine):
             try:
                 self.delay.wait()
 
-                with DDGS(timeout=self.timeout) as ddgs:
+                with DDGS(timeout=self.timeout, proxy=self.session.proxy) as ddgs:
                     raw_results = list(ddgs.text(query, max_results=max_results))
 
                 self.delay.mark_success()
